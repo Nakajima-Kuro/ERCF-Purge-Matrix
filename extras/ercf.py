@@ -111,6 +111,8 @@ class Ercf:
     ACTION_HOMING = 8
     ACTION_SELECTING = 9
 
+    PURGE_TEMP_UNKOWN = -1
+
     # Extruder homing sensing strategies
     EXTRUDER_COLLISION = 0
     EXTRUDER_STALLGUARD = 1
@@ -218,6 +220,10 @@ class Ercf:
         self.default_gate_material = list(config.getlist('gate_material', []))
         self.default_gate_color = list(config.getlist('gate_color', []))
         self.persistence_level = config.getint('persistence_level', 0, minval=0, maxval=4)
+        self.purge_matrix = list(config.getlist('purge_matrix', []))
+        self.tool_purge_temp = list(config.getlist('tool_purge_temp', []))
+        self.purge_speed = config.getint('purge_speed', 5, minval=1)
+        self.default_purge_length = config.getint('default_purge_length', 10, minval=1)
 
         # Logging
         self.log_level = config.getint('log_level', 1, minval=0, maxval=4)
@@ -273,6 +279,24 @@ class Ercf:
             for i in range(len(self.selector_offsets)):
                 self.default_tool_to_gate_map.append(i)
         self.tool_to_gate_map = list(self.default_tool_to_gate_map)
+
+        # Purge matrix
+        if len(self.purge_matrix) > 0:
+            if not len(self.purge_matrix) == len(self.selector_offsets) * len(self.selector_offsets):
+                raise self.config.error("purge_matrix has different number of values than the sqare number of gates")
+        else:
+            for i in range(len(self.selector_offsets) * len(self.selector_offsets)):
+                self.purge_matrix.append(self.default_purge_length)
+        self.purge_matrix = list(self.purge_matrix)
+
+        # Tool purge temp
+        if len(self.tool_purge_temp) > 0:
+            if not len(self.tool_purge_temp) == len(self.selector_offsets):
+                raise self.config.error("tool_purge_temp has different number of values than the number of gates")
+        else:
+            for i in range(len(self.selector_offsets)):
+                self.tool_purge_temp.append(self.PURGE_TEMP_UNKOWN)
+        self.tool_purge_temp = list(self.tool_purge_temp)
 
         # Initialize state and statistics variables
         self._initialize_state()
@@ -434,6 +458,10 @@ class Ercf:
                     self.cmd_ERCF_CHECK_GATES,
                     desc = self.cmd_ERCF_CHECK_GATES_help)
 
+    # Purge
+        self.gcode.register_command('_ERCF_PURGE',
+                    self.cmd_ERCF_PURGE,
+                    desc = self.cmd_ERCF_PURGE_help)
     def handle_connect(self):
         # Setup background file based logging before logging any messages
         if self.logfile_level >= 0:
@@ -546,6 +574,7 @@ class Ercf:
         self.action = self.ACTION_IDLE
         self.calibrating = False
         self.saved_toolhead_position = False
+        self.tool_already_ready = True
         self._reset_statistics()
 
     def _load_persisted_state(self):
@@ -2448,8 +2477,10 @@ class Ercf:
         self._log_debug("Tool change initiated %s" % ("with slicer forming tip" if skip_tip else "with standalone ERCF tip formation"))
         skip_unload = False
         initial_tool_string = "Unknown" if self.tool_selected < 0 else ("T%d" % self.tool_selected)
+        self.tool_already_ready = False
         if tool == self.tool_selected and self.loaded_status == self.LOADED_STATUS_FULL:
                 self._log_always("Tool T%d is already ready" % tool)
+                self.tool_already_ready = True
                 return
 
         if self.loaded_status == self.LOADED_STATUS_UNLOADED:
@@ -3458,6 +3489,44 @@ class Ercf:
             self.calibrating = False
             self._servo_up()
             self._set_action(current_action)
+### GCODE COMMANDS FOR PURGE ##################################
+    cmd_ERCF_PURGE_help = "Purge filament base on the amount set by purge matrix"
+    def cmd_ERCF_PURGE(self, gcmd):
+        if self._check_is_disabled(): return
+        if self._check_is_paused(): return
+        if not self._check_is_loaded(): 
+            self._log_always("No filament inside the extruder! Purge abort!")
+            return
+        try:
+            if self.tool_selected != self.TOOL_UNKNOWN:
+                if self.tool_purge_temp[self.tool_selected] == self.PURGE_TEMP_UNKOWN:
+                    self._log_always("tool_purge_temp must be specify. Purge abort!")
+                    return
+                if self.tool_already_ready == False and self._last_tool != self.TOOL_UNKNOWN:
+                    #If load a new tool
+                    self._log_always("Purge from tool T" + str(self._last_tool) + " to T" + str(self.tool_selected))
+                    purge_length = self.purge_matrix[self._last_tool * len(self.selector_offsets) + self.tool_selected]
+                else:
+                    #If load the same tool as before
+                    self._log_always("Purge with same tool T" + str(self.tool_selected))
+                    purge_length = self.purge_matrix[self.tool_selected * len(self.selector_offsets) + self.tool_selected]
+                purge_length = int(purge_length)
+                if purge_length < 0:
+                    purge_length = self.default_purge_length
+                self._log_always("Purge amount: " + str(purge_length) + " mm")
+                self._set_above_min_temp(int(self.tool_purge_temp[self.tool_selected]))
+                pos = self.toolhead.get_position()
+                pos[3] += purge_length
+                self.toolhead.manual_move(pos, self.purge_speed)
+                self.toolhead.wait_moves()
+                self.toolhead.set_position(pos)  # Force subsequent incremental move
+                self._set_above_min_temp(-1)  # Set nozzle temp back to printing temp
+                self.tool_already_ready = True
+            else:
+                self._log_always("Unknown current tool and last tool. Purge abort!")
+                return
+        except ErcfError as ee:
+            self._pause(str(ee))
 
 def load_config(config):
     return Ercf(config)
